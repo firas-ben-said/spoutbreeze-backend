@@ -1,8 +1,8 @@
 import asyncio
+import ssl
 import httpx
 from datetime import datetime, timedelta
-from sqlalchemy import select
-from fastapi import HTTPException
+from sqlalchemy import select, update
 from typing import Optional, Dict, Any
 
 from app.config.chat_manager import chat_manager
@@ -24,17 +24,50 @@ class TwitchIRCClient:
         self.reader = None
         self.writer = None
         self.token = None
+        self.connection_enabled = True
+        self.last_auth_check = None
+        self.auth_check_interval = 300  # Check every 5 minutes
+        self.is_connected = False
+        self.ping_task = None
 
-    async def get_active_token(self) -> str:
-        """Get the active token from database"""
+    def _get_public_ssl_context(self):
+        """Create SSL context for public APIs with system certificates"""
+        ssl_context = ssl.create_default_context()
+
+        # Try different system certificate locations
+        cert_paths = [
+            "/etc/ssl/certs/ca-certificates.crt",  # Debian/Ubuntu
+            "/etc/pki/tls/certs/ca-bundle.crt",    # CentOS/RHEL
+            "/etc/ssl/cert.pem",                   # macOS
+        ]
+
+        for cert_path in cert_paths:
+            try:
+                ssl_context.load_verify_locations(cert_path)
+                return ssl_context
+            except FileNotFoundError:
+                continue
+
+        # Fallback to certifi if available
         try:
-            # Get database session
+            import certifi
+
+            ssl_context.load_verify_locations(certifi.where())
+            return ssl_context
+        except ImportError:
+            pass
+
+        # Last resort: use default context
+        return ssl.create_default_context()
+
+    async def get_active_token(self) -> Optional[str]:
+        """Get the active token from database, return None if no valid token exists"""
+        try:
             async for db in get_db():
-                # Query for active, non-expired token
                 stmt = (
                     select(TwitchToken)
                     .where(
-                        TwitchToken.is_active == True,
+                        TwitchToken.is_active,
                         TwitchToken.expires_at > datetime.now(),
                     )
                     .order_by(TwitchToken.created_at.desc())
@@ -47,50 +80,52 @@ class TwitchIRCClient:
                     logger.info("[TwitchIRC] Using database user access token")
                     return token_record.access_token
                 else:
-                    logger.warning("[TwitchIRC] No valid token found in database")
-                    raise HTTPException(
-                        status_code=401,
-                        detail="No valid Twitch token found. Please authenticate via /auth/twitch/login",
+                    # Check if we have any tokens at all (active but expired)
+                    expired_stmt = (
+                        select(TwitchToken)
+                        .where(TwitchToken.is_active)
+                        .order_by(TwitchToken.created_at.desc())
                     )
+                    expired_result = await db.execute(expired_stmt)
+                    expired_token = expired_result.scalars().first()
 
-            # This should never be reached due to the logic above, but mypy needs it
-            raise HTTPException(
-                status_code=500,
-                detail="Unexpected error: database session not available",
-            )
+                    if expired_token:
+                        logger.warning(
+                            "[TwitchIRC] Token has expired, attempting refresh..."
+                        )
+                        return None
+                    else:
+                        logger.info(
+                            "[TwitchIRC] No Twitch tokens found - user needs to authenticate"
+                        )
+                        self.connection_enabled = False
+                        return None
 
-        except HTTPException:
-            raise
         except Exception as e:
             logger.error(f"[TwitchIRC] Error fetching token from database: {e}")
-            raise HTTPException(
-                status_code=500, detail="Database error while fetching Twitch token"
-            )
+            return None
 
     async def refresh_token_if_needed(self):
         """Check if token needs refresh and refresh if possible"""
         try:
             async for db in get_db():
+                # Get the most recent active token
                 stmt = (
                     select(TwitchToken)
-                    .where(TwitchToken.is_active == True)
+                    .where(TwitchToken.is_active)
                     .order_by(TwitchToken.created_at.desc())
                 )
-
                 result = await db.execute(stmt)
                 token_record = result.scalars().first()
 
                 if not token_record:
-                    logger.warning("[TwitchIRC] No active token found")
-                    break
+                    logger.warning("[TwitchIRC] No valid token found in database")
+                    return
 
-                # Check if token expires within 5 minutes or has already expired
-                expires_soon = datetime.now() + timedelta(minutes=5)
-
-                if token_record.expires_at <= expires_soon:
-                    logger.info(
-                        "[TwitchIRC] Token expires soon or has expired, attempting refresh..."
-                    )
+                # Check if token needs refresh (expires within 5 minutes)
+                current_time = datetime.now()
+                if token_record.expires_at <= current_time + timedelta(minutes=5):
+                    logger.info("[TwitchIRC] Token expires soon, attempting refresh...")
 
                     if token_record.refresh_token:
                         new_token_data = await self._refresh_access_token(
@@ -99,49 +134,41 @@ class TwitchIRCClient:
 
                         if new_token_data:
                             # Update the existing token record
-                            new_expires_at = datetime.now() + timedelta(
+                            new_expires_at = current_time + timedelta(
                                 seconds=new_token_data.get("expires_in", 3600)
                             )
 
-                            token_record.access_token = new_token_data["access_token"]
-                            token_record.expires_at = new_expires_at
-                            # Refresh token might be updated too
-                            if new_token_data.get("refresh_token"):
-                                token_record.refresh_token = new_token_data[
-                                    "refresh_token"
-                                ]
-
-                            await db.commit()
-                            logger.info("[TwitchIRC] Token refreshed successfully")
-
-                            # Update the current token if we're using this one
-                            if (
-                                hasattr(self, "token")
-                                and self.token == token_record.access_token
-                            ):
-                                self.token = new_token_data["access_token"]
-                        else:
-                            logger.error(
-                                "[TwitchIRC] Failed to refresh token, marking as inactive"
+                            stmt = (
+                                update(TwitchToken)
+                                .where(TwitchToken.id == token_record.id)
+                                .values(
+                                    access_token=new_token_data.get("access_token"),
+                                    refresh_token=new_token_data.get(
+                                        "refresh_token", token_record.refresh_token
+                                    ),
+                                    expires_at=new_expires_at,
+                                )
                             )
-                            token_record.is_active = False
+                            await db.execute(stmt)
                             await db.commit()
+                            logger.info("[TwitchIRC] Token successfully refreshed")
+                        else:
+                            logger.error("[TwitchIRC] Failed to refresh token")
                     else:
-                        logger.warning(
-                            "[TwitchIRC] No refresh token available, marking as inactive"
-                        )
-                        token_record.is_active = False
-                        await db.commit()
-                break
+                        logger.warning("[TwitchIRC] No refresh token available")
+
         except Exception as e:
-            logger.error(f"[TwitchIRC] Error checking/refreshing token: {e}")
+            logger.error(f"[TwitchIRC] Error during token refresh: {e}")
 
     async def _refresh_access_token(
         self, refresh_token: str
     ) -> Optional[Dict[str, Any]]:
         """Refresh the access token using the refresh token"""
         try:
-            async with httpx.AsyncClient() as client:
+            # Use system SSL context for Twitch API
+            ssl_context = self._get_public_ssl_context()
+
+            async with httpx.AsyncClient(verify=ssl_context) as client:
                 response = await client.post(
                     "https://id.twitch.tv/oauth2/token",
                     data={
@@ -154,9 +181,7 @@ class TwitchIRCClient:
                 )
 
                 if response.status_code == 200:
-                    token_data = response.json()
-                    logger.info("[TwitchIRC] Access token refreshed successfully")
-                    return token_data
+                    return response.json()
                 else:
                     logger.error(
                         f"[TwitchIRC] Token refresh failed: {response.status_code} - {response.text}"
@@ -169,26 +194,54 @@ class TwitchIRCClient:
 
     async def connect(self):
         """Connect to Twitch IRC with database token"""
-        while True:
+        consecutive_failures = 0
+        max_failures = 3
+
+        while self.connection_enabled:
             try:
-                # Check and refresh token if needed before connecting
-                await self.refresh_token_if_needed()
+                # Only check auth status periodically
+                current_time = datetime.now()
+                if (
+                    self.last_auth_check is None
+                    or (current_time - self.last_auth_check).seconds
+                    > self.auth_check_interval
+                ):
+                    await self.refresh_token_if_needed()
+                    self.last_auth_check = current_time
 
                 # Get fresh token from database
                 self.token = await self.get_active_token()
 
                 if not self.token:
-                    logger.error(
-                        "[TwitchIRC] No token available, retrying in 30 seconds..."
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_failures:
+                        logger.warning(
+                            "[TwitchIRC] No valid token available after multiple attempts. "
+                            "Disabling connection until user re-authenticates. "
+                            "Please visit /auth/twitch/login to reconnect."
+                        )
+                        self.connection_enabled = False
+                        # Notify via chat manager that Twitch is disconnected
+                        await chat_manager.broadcast(
+                            "SYSTEM: Twitch chat disconnected - authentication required"
+                        )
+                        break
+
+                    logger.info(
+                        f"[TwitchIRC] No token available, waiting 60 seconds... (attempt {consecutive_failures}/{max_failures})"
                     )
-                    await asyncio.sleep(30)
+                    await asyncio.sleep(60)
                     continue
 
-                # logger.info(f"[TwitchIRC] Using token: {self.token[:10]}...")
+                # Reset failure counter on successful token retrieval
+                consecutive_failures = 0
 
-                # Open a secure TLS connection in one call
+                # Use system SSL context for IRC connection too
+                ssl_context = self._get_public_ssl_context()
+
+                # Open a secure TLS connection with proper SSL context
                 self.reader, self.writer = await asyncio.open_connection(
-                    self.server, self.port, ssl=True
+                    self.server, self.port, ssl=ssl_context
                 )
 
                 # Send PASS, NICK, JOIN
@@ -198,58 +251,178 @@ class TwitchIRCClient:
                 await self.writer.drain()
 
                 logger.info("[TwitchIRC] Connected, listening for messages…")
+                await chat_manager.broadcast("SYSTEM: Twitch chat connected")
                 await self.listen()
+
             except Exception as e:
-                logger.info(f"[TwitchIRC] Connection error: {e!r}")
-                # Back off before retrying
-                await asyncio.sleep(5)
+                consecutive_failures += 1
+                logger.info(
+                    f"[TwitchIRC] Connection error: {e!r} (attempt {consecutive_failures}/{max_failures})"
+                )
+
+                if consecutive_failures >= max_failures:
+                    logger.warning(
+                        "[TwitchIRC] Too many connection failures, disabling automatic reconnection"
+                    )
+                    self.connection_enabled = False
+                    await chat_manager.broadcast(
+                        "SYSTEM: Twitch chat connection failed - please check authentication"
+                    )
+                    break
+
+                # Exponential backoff
+                backoff_time = min(60, 5 * (2 ** (consecutive_failures - 1)))
+                await asyncio.sleep(backoff_time)
+
+        logger.info("[TwitchIRC] Connection loop stopped")
+
+    def enable_connection(self):
+        """Re-enable connection attempts (call this after successful auth)"""
+        self.connection_enabled = True
+        logger.info("[TwitchIRC] Connection re-enabled")
+
+    # async def start_token_refresh_scheduler(self):
+    #     """Start a background task to periodically check and refresh tokens"""
+    #     while True:
+    #         try:
+    #             if self.connection_enabled:
+    #                 await self.refresh_token_if_needed()
+    #             # Check every 30 minutes
+    #             await asyncio.sleep(1800)
+    #         except Exception as e:
+    #             logger.error(f"[TwitchIRC] Token refresh scheduler error: {e}")
+    #             await asyncio.sleep(300)  # Wait 5 minutes on error
 
     async def listen(self):
-        while True:
-            line = await self.reader.readline()
-            if not line:
-                # socket closed
-                raise ConnectionResetError("Stream closed")
-            msg = line.decode(errors="ignore").strip()
+        """Listen for IRC messages"""
+        try:
+            while True:
+                data = await self.reader.readline()
+                if not data:
+                    break
 
-            if msg.startswith("PING"):
-                # respond to PING to keep the connection alive
-                self.writer.write("PONG :tmi.twitch.tv\r\n".encode())
-                await self.writer.drain()
-                continue
+                message = data.decode("utf-8").strip()
+                logger.info(f"[TwitchIRC] Received: {message}")
 
-            if "PRIVMSG" in msg:
-                # raw IRC line
-                logger.info(f"[TwitchIRC] ← {msg}")
+                # Handle PING
+                if message.startswith("PING"):
+                    pong_response = message.replace("PING", "PONG")
+                    self.writer.write(f"{pong_response}\r\n".encode())
+                    await self.writer.drain()
 
-                # (optional) parse out username and text
-                # prefix is like: ":username!username@username.tmi.twitch.tv PRIVMSG #channel :message text"
-                try:
-                    payload = msg.split("PRIVMSG", 1)[1]
-                    user = msg.split("!", 1)[0].lstrip(":")
-                    text = payload.split(":", 1)[1]
-                    logger.info(f"[TwitchIRC] {user}: {text}")
-                except Exception:
-                    pass
+                # Handle chat messages and broadcast them
+                if "PRIVMSG" in message:
+                    await chat_manager.broadcast(f"TWITCH: {message}")
 
-                await chat_manager.broadcast(msg)
+        except Exception as e:
+            logger.error(f"[TwitchIRC] Listen error: {e}")
+        finally:
+            if self.writer:
+                self.writer.close()
+                await self.writer.wait_closed()
 
     async def send_message(self, message: str):
+        """Send a message to the Twitch channel"""
         if self.writer:
-            full_message = f"PRIVMSG {self.channel} :{message}\r\n"
-            self.writer.write(full_message.encode())
+            self.writer.write(f"PRIVMSG {self.channel} :{message}\r\n".encode())
             await self.writer.drain()
-            logger.info(f"[TwitchIRC] Sent: {message}")
-        else:
-            logger.info("[TwitchIRC] Writer not initialized, cannot send message.")
 
-    async def start_token_refresh_scheduler(self):
-        """Start a background task to periodically check and refresh tokens"""
-        while True:
-            try:
-                await self.refresh_token_if_needed()
-                # Check every 30 minutes
-                await asyncio.sleep(1800)
-            except Exception as e:
-                logger.error(f"[TwitchIRC] Token refresh scheduler error: {e}")
-                await asyncio.sleep(300)  # Wait 5 minutes on error
+    async def connect_for_meeting(self) -> bool:
+        """Connect to Twitch IRC specifically for a meeting"""
+        try:
+            token = await self.get_active_token()
+            if not token:
+                logger.warning("[TwitchIRC] No valid token for meeting connection")
+                return False
+
+            # Create SSL context for connection
+            ssl_context = self._get_public_ssl_context()
+
+            # Connect to Twitch IRC
+            self.reader, self.writer = await asyncio.open_connection(
+                self.server, self.port, ssl=ssl_context
+            )
+
+            # Authenticate
+            self.writer.write(f"PASS oauth:{token}\r\n".encode())
+            self.writer.write(f"NICK {self.nickname}\r\n".encode())
+            self.writer.write(f"JOIN {self.channel}\r\n".encode())
+            await self.writer.drain()
+
+            self.is_connected = True
+
+            # Start ping handler and message listener
+            self.ping_task = asyncio.create_task(self._handle_connection())
+
+            logger.info("[TwitchIRC] Connected for meeting")
+            return True
+
+        except Exception as e:
+            logger.error(f"[TwitchIRC] Failed to connect for meeting: {e}")
+            return False
+
+    async def disconnect_from_meeting(self):
+        """Disconnect from Twitch IRC when meeting ends"""
+        try:
+            self.is_connected = False
+
+            if self.ping_task:
+                self.ping_task.cancel()
+                try:
+                    await self.ping_task
+                except asyncio.CancelledError:
+                    pass
+
+            if self.writer:
+                self.writer.write(f"PART {self.channel}\r\n".encode())
+                await self.writer.drain()
+                self.writer.close()
+                await self.writer.wait_closed()
+
+            self.reader = None
+            self.writer = None
+
+            logger.info("[TwitchIRC] Disconnected from meeting")
+
+        except Exception as e:
+            logger.error(f"[TwitchIRC] Error during meeting disconnect: {e}")
+
+    async def _handle_connection(self):
+        """Handle IRC connection (PING/PONG and messages)"""
+        try:
+            while self.is_connected and self.reader:
+                try:
+                    # Set a timeout for reading
+                    data = await asyncio.wait_for(self.reader.readline(), timeout=30.0)
+                    if not data:
+                        break
+
+                    message = data.decode('utf-8').strip()
+
+                    # Handle PING (respond immediately)
+                    if message.startswith("PING"):
+                        pong_response = message.replace("PING", "PONG")
+                        self.writer.write(f"{pong_response}\r\n".encode())
+                        await self.writer.drain()
+                        # Don't log PINGs - they're just keepalives
+                        continue
+
+                    # Log other messages
+                    if message:
+                        logger.info(f"[TwitchIRC] {message}")
+
+                        # Handle chat messages
+                        if "PRIVMSG" in message:
+                            await chat_manager.broadcast(f"TWITCH: {message}")
+
+                except asyncio.TimeoutError:
+                    # Send keepalive if no data received
+                    if self.writer and self.is_connected:
+                        self.writer.write("PING :keepalive\r\n".encode())
+                        await self.writer.drain()
+                    continue
+
+        except Exception as e:
+            logger.error(f"[TwitchIRC] Connection handler error: {e}")
+        finally:
+            self.is_connected = False

@@ -35,6 +35,7 @@ async def create_meeting(
         request=request,
         user_id=UUID(str(current_user.id)),
         db=db,
+        enable_twitch=True,  # Enable Twitch integration by default
     )
     return result
 

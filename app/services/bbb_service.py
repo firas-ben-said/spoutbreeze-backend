@@ -24,6 +24,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, delete  # noqa: F401
 from uuid import UUID
 from app.config.logger_config import logger
+from app.services.twitch_service import TwitchService
+from app.config.twitch_irc import TwitchIRCClient
 
 
 class BBBService:
@@ -31,6 +33,7 @@ class BBBService:
         self.settings = get_settings()
         self.server_base_url = self.settings.bbb_server_base_url
         self.secret = self.settings.bbb_secret
+        self.twitch_client = None
 
     async def create_meeting(
         self,
@@ -38,6 +41,7 @@ class BBBService:
         user_id: UUID,
         db: AsyncSession,
         event_id: Optional[UUID] = None,
+        enable_twitch: bool = False,
     ) -> Dict[str, Any]:
         """Create a new BBB meeting."""
         # Generate a meeting ID if not provided
@@ -97,6 +101,45 @@ class BBBService:
                 detail=f"Failed to create meeting: {response.get('messageKey')}",
             )
 
+        # Connect to Twitch if requested and token available
+        twitch_status = {"enabled": False}
+        if enable_twitch:
+            try:
+                twitch_service = TwitchService()
+
+                if await twitch_service.is_token_valid():
+                    self.twitch_client = TwitchIRCClient()
+
+                    connected = await self.twitch_client.connect_for_meeting()
+                    if connected:
+                        twitch_status = {
+                            "enabled": True,
+                            "status": "connected",
+                            "channel": self.twitch_client.channel,
+                        }
+                        logger.info(
+                            f"[BBB] Meeting {response.get('meetingID')} created with Twitch chat"
+                        )
+                    else:
+                        twitch_status = {
+                            "enabled": False,
+                            "status": "failed",
+                            "error": "Failed to connect to Twitch IRC",
+                        }
+                else:
+                    twitch_status = {
+                        "enabled": False,
+                        "status": "no_token",
+                        "error": "No valid Twitch token available",
+                    }
+            except Exception as e:
+                logger.error(f"[BBB] Twitch connection error: {e}")
+                twitch_status = {
+                    "enabled": False,
+                    "status": "error",
+                    "error": str(e),
+                }
+
         # Save meeting details to the database
         meeting = BbbMeeting(
             meeting_id=response.get("meetingID"),
@@ -118,6 +161,10 @@ class BBBService:
         await db.commit()
         await db.refresh(meeting)
         logger.info(f"Meeting created with ID: {meeting.meeting_id} by user: {user_id}")
+
+        # Add Twitch status to response
+        response["twitch"] = twitch_status
+
         return response
 
     def join_meeting(
@@ -172,6 +219,12 @@ class BBBService:
         response = self._call_bbb_api("end", params)
 
         if response.get("returncode") == "SUCCESS":
+            # Disconnect from Twitch if connected
+            if self.twitch_client:
+                await self.twitch_client.disconnect_from_meeting()
+                self.twitch_client = None
+                logger.info(f"[BBB] Meeting {request.meeting_id} ended, Twitch disconnected")
+
             # Update the meeting in the database
             stmt = select(BbbMeeting).where(BbbMeeting.meeting_id == request.meeting_id)
             result = await db.execute(stmt)

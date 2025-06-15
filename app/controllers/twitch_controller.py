@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Query, HTTPException, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import update
+from sqlalchemy import update, select
 from app.config.database.session import get_db
 from app.config.twitch_auth import TwitchAuth
 from app.models.twitch.twitch_models import TwitchToken
@@ -32,7 +32,7 @@ async def twitch_callback(
         # Deactivate old tokens using SQLAlchemy ORM
         stmt = (
             update(TwitchToken)
-            .where(TwitchToken.is_active == True)
+            .where(TwitchToken.is_active)
             .values(is_active=False)
         )
         await db.execute(stmt)
@@ -65,113 +65,50 @@ async def twitch_login():
     return {"authorization_url": auth_url}
 
 
-# @router.post("/twitch/test-refresh")
-# async def test_token_refresh(db: AsyncSession = Depends(get_db)):
-#     """Test endpoint to force token refresh"""
-#     try:
-#         from app.config.twitch_irc import TwitchIRCClient
-#         twitch_client = TwitchIRCClient()
-#         # Check current token status
-#         stmt = select(TwitchToken).where(
-#             TwitchToken.is_active == True
-#         ).order_by(TwitchToken.created_at.desc())
+@router.post("/twitch/disconnect")
+async def twitch_disconnect(db: AsyncSession = Depends(get_db)):
+    """Disconnect from Twitch by deactivating tokens"""
+    try:
+        # Deactivate all active tokens
+        stmt = (
+            update(TwitchToken)
+            .where(TwitchToken.is_active)
+            .values(is_active=False)
+        )
+        await db.execute(stmt)
+        await db.commit()
 
-#         result = await db.execute(stmt)
-#         token_record = result.scalars().first()
+        # Disable IRC connection
+        from app.main import twitch_client
 
-#         if not token_record:
-#             return {"error": "No active token found"}
+        twitch_client.connection_enabled = False
 
-#         current_time = datetime.now()
-#         time_until_expiry = token_record.expires_at - current_time
+        return {"message": "Successfully disconnected from Twitch"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to disconnect: {str(e)}")
 
-#         response = {
-#             "current_token": token_record.access_token[:20] + "...",
-#             "expires_at": token_record.expires_at.isoformat(),
-#             "time_until_expiry": str(time_until_expiry),
-#             "has_refresh_token": bool(token_record.refresh_token),
-#             "refresh_needed": token_record.expires_at <= current_time + timedelta(minutes=5)
-#         }
 
-#         # Force refresh test
-#         await twitch_client.refresh_token_if_needed()
+@router.get("/twitch/status")
+async def twitch_status(db: AsyncSession = Depends(get_db)):
+    """Get current Twitch connection status"""
+    try:
+        from app.main import twitch_client
 
-#         # Check if token was updated
-#         await db.refresh(token_record)
-#         response["token_after_refresh"] = token_record.access_token[:20] + "..."
-#         response["new_expires_at"] = token_record.expires_at.isoformat()
-#         response["refresh_performed"] = response["current_token"] != response["token_after_refresh"]
+        stmt = (
+            select(TwitchToken)
+            .where(TwitchToken.is_active)
+            .order_by(TwitchToken.created_at.desc())
+        )
+        result = await db.execute(stmt)
+        token_record = result.scalars().first()
 
-#         return response
-
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=f"Test failed: {str(e)}")
-
-# @router.post("/twitch/simulate-expiring-token")
-# async def simulate_expiring_token(db: AsyncSession = Depends(get_db)):
-#     """Simulate a token that's about to expire for testing refresh functionality"""
-#     try:
-#         # Get current active token
-#         stmt = select(TwitchToken).where(
-#             TwitchToken.is_active == True
-#         ).order_by(TwitchToken.created_at.desc())
-
-#         result = await db.execute(stmt)
-#         token_record = result.scalars().first()
-
-#         if not token_record:
-#             return {"error": "No active token found"}
-
-#         # Set token to expire in 2 minutes (within the 5-minute refresh window)
-#         old_expiry = token_record.expires_at
-#         token_record.expires_at = datetime.now() + timedelta(minutes=2)
-#         await db.commit()
-
-#         current_time = datetime.now()
-#         expires_soon_threshold = current_time + timedelta(minutes=5)
-#         will_trigger_refresh = token_record.expires_at <= expires_soon_threshold
-
-#         return {
-#             "message": "Token set to expire soon for testing",
-#             "old_expiry": old_expiry.isoformat(),
-#             "new_expiry": token_record.expires_at.isoformat(),
-#             "current_time": current_time.isoformat(),
-#             "expires_in_minutes": 2,
-#             "will_trigger_refresh": will_trigger_refresh,
-#             "refresh_threshold": expires_soon_threshold.isoformat(),
-#             "instruction": "Now call /auth/twitch/test-refresh to test the refresh mechanism"
-#         }
-
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=f"Simulation failed: {str(e)}")
-
-# @router.get("/twitch/token-status")
-# async def get_token_status(db: AsyncSession = Depends(get_db)):
-#     """Get current token status"""
-#     try:
-#         stmt = select(TwitchToken).where(
-#             TwitchToken.is_active == True
-#         ).order_by(TwitchToken.created_at.desc())
-
-#         result = await db.execute(stmt)
-#         token_record = result.scalars().first()
-
-#         if not token_record:
-#             return {"error": "No active token found"}
-
-#         current_time = datetime.now()
-#         time_until_expiry = token_record.expires_at - current_time
-
-#         return {
-#             "token_preview": token_record.access_token[:20] + "...",
-#             "expires_at": token_record.expires_at.isoformat(),
-#             "current_time": current_time.isoformat(),
-#             "time_until_expiry": str(time_until_expiry),
-#             "is_expired": token_record.expires_at <= current_time,
-#             "expires_soon": token_record.expires_at <= current_time + timedelta(minutes=5),
-#             "has_refresh_token": bool(token_record.refresh_token),
-#             "created_at": token_record.created_at.isoformat()
-#         }
-
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=f"Status check failed: {str(e)}")
+        return {
+            "connection_enabled": twitch_client.connection_enabled,
+            "has_active_token": bool(token_record),
+            "token_expires_at": token_record.expires_at.isoformat()
+            if token_record
+            else None,
+            "is_connected": twitch_client.writer is not None,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Status check failed: {str(e)}")

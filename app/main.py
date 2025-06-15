@@ -63,11 +63,11 @@ async def lifespan(app: FastAPI):
     app.openapi_schema = openapi_schema
 
     # Startup: schedule the IRC client
-    twitch_tasks = asyncio.gather(
-        twitch_client.connect(),
-        twitch_client.start_token_refresh_scheduler(),
-        return_exceptions=True,
-    )
+    # twitch_tasks = asyncio.gather(
+    #     twitch_client.connect(),
+    #     twitch_client.start_token_refresh_scheduler(),
+    #     return_exceptions=True,
+    # )
 
     logger.info("[TwitchIRC] Background connect and token refresh tasks scheduled")
 
@@ -87,11 +87,11 @@ async def lifespan(app: FastAPI):
     yield  # App is running
 
     # Shutdown: cancel the IRC task
-    twitch_tasks.cancel()
-    try:
-        await twitch_tasks
-    except asyncio.CancelledError:
-        logger.info("[TwitchIRC] Connect task cancelled cleanly")
+    # twitch_tasks.cancel()
+    # try:
+    #     await twitch_tasks
+    # except asyncio.CancelledError:
+    #     logger.info("[TwitchIRC] Connect task cancelled cleanly")
 
 
 app = FastAPI(
